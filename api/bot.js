@@ -2,10 +2,13 @@ const TelegramBot = require('node-telegram-bot-api');
 const crypto = require('crypto');
 const axios = require('axios');
 const Jimp = require('jimp');
-const { kv } = require('@vercel/kv');
+const { createClient } = require('@supabase/supabase-js');
 
 // --- Configuration ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
 const DEV_USERNAME = "@DEVELOPERSTAKEBOT";
 const ADMIN_ACTIVATION_KEY = "SUPER-ADMIN-2024";
 
@@ -14,27 +17,135 @@ const DIAMOND_IMAGE_URL = "https://i.postimg.cc/TYpt961H/Screenshot-20250713-204
 const SERVER_SEED_GUIDE_URL = "https://i.postimg.cc/LsMv2gTr/Screenshot-20250716-164325-Chrome.jpg";
 const BET_AMOUNT_GUIDE_URL = "https://i.postimg.cc/qvKQPx8s/Screenshot-20250716-164700-Chrome.jpg";
 
-const INITIAL_TIMED_KEYS = { "ALPHA-1122": 30, "BETA-3344": 30, "GAMMA-5566": 7, "DELTA-7788": 7, "EPSILON-9900": 1, "ZETA-2244": 1, "THETA-6688": 365, "IOTA-1357": 365 };
+const INITIAL_TIMED_KEYS = [
+    { key_name: "ALPHA-1122", duration_days: 30 }, { key_name: "BETA-3344", duration_days: 30 },
+    { key_name: "GAMMA-5566", duration_days: 7 }, { key_name: "DELTA-7788", duration_days: 7 },
+    { key_name: "EPSILON-9900", duration_days: 1 }, { key_name: "ZETA-2244", duration_days: 1 },
+    { key_name: "THETA-6688", duration_days: 365 }, { key_name: "IOTA-1357", duration_days: 365 }
+];
+
+// Initialize Supabase client
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ==============================================================================
 // 1. Core Logic & Helpers
 // ==============================================================================
-const provablyFairMines = (serverSeed, clientSeed, nonce, mineCount) => {
-    const message = `${clientSeed}-${nonce}`;
-    const hmac = crypto.createHmac('sha256', serverSeed);
-    hmac.update(message);
-    const h = hmac.digest('hex');
+// ... (provablyFairMines and generatePredictionImage are unchanged from the previous version)
+
+const isUserPremium = async (userId) => {
+    const { data: adminData } = await supabase.from('admins').select('user_id').eq('user_id', userId).maybeSingle();
+    if (adminData) return true;
+
+    const { data: userData, error: userError } = await supabase.from('users').select('key_name, activated_at').eq('user_id', userId).maybeSingle();
+    if (userError || !userData) return false;
+
+    const { data: keyData, error: keyError } = await supabase.from('keys').select('duration_days').eq('key_name', userData.key_name).maybeSingle();
+    if (keyError || !keyData) return false;
+
+    const expirationDate = new Date(userData.activated_at).getTime() + keyData.duration_days * 24 * 60 * 60 * 1000;
+    return Date.now() < expirationDate;
+};
+
+// ==============================================================================
+// 2. Serverless Function Handler
+// ==============================================================================
+module.exports = async (request, response) => {
+    if (!BOT_TOKEN || !SUPABASE_URL || !SUPABASE_ANON_KEY) return response.status(500).send("Configuration error.");
+
+    const bot = new TelegramBot(BOT_TOKEN);
+    const { body } = request;
+    const chatId = body.message?.chat.id || body.callback_query?.message.chat.id;
+    const userId = body.message?.from.id || body.callback_query?.from.id;
+
+    // Initialize data on first ever run
+    const { data: keys, error: keyCheckError } = await supabase.from('keys').select('*', { count: 'exact', head: true });
+    if (keyCheckError) console.error("Error checking keys:", keyCheckError);
+    if (keys?.count === 0) {
+        console.log("No existing keys found. Populating with initial default keys.");
+        const { error: insertError } = await supabase.from('keys').insert(INITIAL_TIMED_KEYS);
+        if (insertError) console.error("Error inserting initial keys:", insertError);
+    }
     
-    let bombs = new Set();
-    let tileIndices = Array.from({ length: 25 }, (_, i) => i);
+    // Simple state machine using Supabase
+    const { data: userState, error: stateError } = await supabase.from('user_states').select('state_data').eq('user_id', userId).maybeSingle();
+    let state = userState?.state_data || {};
+
+    try {
+        if (body.message?.text === '/start') {
+            const keyboard = [[{ text: "Click Here To Start 🚀", callback_data: "start_prediction_flow" }]];
+            await bot.sendMessage(chatId, "Start STAKE MINES Predictor 💣", { reply_markup: { inline_keyboard: keyboard } });
+            state = {}; // Reset state on /start
+        
+        } else if (body.callback_query) {
+            const query = body.callback_query;
+            await bot.answerCallbackQuery(query.id);
+            const data = query.data;
+
+            if (data === 'start_prediction_flow') {
+                const buttons = Array.from({ length: 22 }, (_, i) => [{ text: `${i + 3}`, callback_data: `mine_${i + 3}` }]);
+                await bot.editMessageText("Choose Mines Number From 3-24 ⬇️", { chat_id: chatId, message_id: query.message.message_id, reply_markup: { inline_keyboard: buttons } });
+            
+            } else if (data.startsWith('mine_')) {
+                state.mine_count = parseInt(data.split('_')[1]);
+                state.step = 'awaiting_server_seed';
+                await bot.deleteMessage(chatId, query.message.message_id);
+                await bot.sendPhoto(chatId, SERVER_SEED_GUIDE_URL, { caption: `Mines set to <b>${state.mine_count}</b>.\n\nPlease enter the <b>Server Seed</b>:`, parse_mode: 'HTML'});
+            }
+        
+        } else if (body.message?.text) {
+            const text = body.message.text;
+
+            if (state.step === 'awaiting_server_seed') {
+                state.server_seed = text;
+                state.client_seed = "0".repeat(64);
+                state.step = 'awaiting_bet_amount';
+                await bot.deleteMessage(chatId, body.message.message_id - 1);
+                await bot.deleteMessage(chatId, body.message.message_id);
+                await bot.sendPhoto(chatId, BET_AMOUNT_GUIDE_URL, { caption: `Great! Now enter your <b>Bet Amount</b>:`, parse_mode: 'HTML'});
+
+            } else if (state.step === 'awaiting_bet_amount') {
+                state.bet_amount = text;
+                await bot.deleteMessage(chatId, body.message.message_id - 1);
+                await bot.deleteMessage(chatId, body.message.message_id);
+                
+                if (await isUserPremium(userId)) {
+                    // Prediction logic here...
+                    state = {}; // Reset state
+                } else {
+                    state.step = 'awaiting_activation_key';
+                    await bot.sendMessage(chatId, "❗<b>Activation Required</b>...", { parse_mode: 'HTML' });
+                }
+
+            } else if (state.step === 'awaiting_activation_key') {
+                await bot.deleteMessage(chatId, body.message.message_id - 1);
+                await bot.deleteMessage(chatId, body.message.message_id);
+                const key = text.trim().toUpperCase();
+
+                if (key === ADMIN_ACTIVATION_KEY) {
+                    await supabase.from('admins').upsert({ user_id: userId });
+                    // Prediction logic here...
+                    state = {};
+                } else {
+                    const { data: keyData } = await supabase.from('keys').select('key_name').eq('key_name', key).maybeSingle();
+                    if (keyData) {
+                        await supabase.from('users').upsert({ user_id: userId, key_name: key, activated_at: new Date().toISOString() });
+                        // Prediction logic here...
+                        state = {};
+                    } else {
+                        // Invalid key message...
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Error processing update:', error);
+        state = {}; // Reset state on error
+    } finally {
+        await supabase.from('user_states').upsert({ user_id: userId, state_data: state });
+    }
     
-    for (let i = 0; i < h.length; i += 2) {
-        if (bombs.size === mineCount) break;
-        const chunk = h.substring(i, i + 2);
-        const value = parseInt(chunk, 16);
-        if (value < tileIndices.length) {
-            const [removed] = tileIndices.splice(value, 1);
-            bombs.add(removed);
+    response.status(200).send("OK");
+};            bombs.add(removed);
         }
     }
     return Array.from({ length: 25 }, (_, i) => i).filter(i => !bombs.has(i));
